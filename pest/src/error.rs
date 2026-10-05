@@ -416,6 +416,96 @@ impl<R: RuleType> Error<R> {
         self
     }
 
+    /// Groups the `Rule`s of a [`ParsingError`] into caller-defined categories
+    /// while keeping every original `Rule` identity visible. It does nothing
+    /// when called on a [`CustomError`].
+    ///
+    /// `classify` maps a rule to its category (`Some(group)`) or to `None`
+    /// for rules that do not belong to any known category. `describe` renders
+    /// a category to its display text.
+    ///
+    /// The resulting message lists negative (unexpected) rules separately
+    /// from positive (expected) ones, exactly like the ungrouped message.
+    /// Rules sharing a category are shown together as `category(rule_a,
+    /// rule_b)`, so two distinct rules in one group keep their two
+    /// identities. Grouping is keyed by the category value itself, never by
+    /// the rendered text: two different categories whose `describe` output is
+    /// identical are still shown as two separate groups and are never merged.
+    /// Rules classified as `None` (unknown group) keep their original rule
+    /// name. Groups and their members appear in stable first-seen order.
+    ///
+    /// This is a pure reorganization of the already collected `positives`
+    /// and `negatives`: the input is not re-parsed, the error location keeps
+    /// the actual line/column within the input, the error semantics are
+    /// unchanged, and the rendered output only shows the offending line, not
+    /// the whole input. When both rule sets are empty the message stays
+    /// `unknown parsing error` (no success hint is ever produced).
+    ///
+    /// [`ParsingError`]: enum.ErrorVariant.html#variant.ParsingError
+    /// [`CustomError`]: enum.ErrorVariant.html#variant.CustomError
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pest::error::{Error, ErrorVariant};
+    /// # use pest::Position;
+    /// # #[allow(non_camel_case_types)]
+    /// # #[allow(dead_code)]
+    /// # #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    /// # enum Rule {
+    /// #     identifier,
+    /// #     number,
+    /// #     semicolon
+    /// # }
+    /// # let input = "";
+    /// # let pos = Position::from_start(input);
+    /// let error = Error::new_from_pos(
+    ///     ErrorVariant::ParsingError {
+    ///         positives: vec![Rule::identifier, Rule::number],
+    ///         negatives: vec![Rule::semicolon],
+    ///     },
+    ///     pos,
+    /// )
+    /// .grouped_rules(
+    ///     |rule| match rule {
+    ///         Rule::identifier | Rule::number => Some("operand"),
+    ///         _ => None,
+    ///     },
+    ///     |group| group.to_string(),
+    /// );
+    ///
+    /// assert_eq!(
+    ///     error.variant.message(),
+    ///     "unexpected semicolon; expected operand(identifier, number)"
+    /// );
+    /// ```
+    pub fn grouped_rules<G, C, M>(mut self, mut classify: C, mut describe: M) -> Error<R>
+    where
+        G: Eq,
+        C: FnMut(&R) -> Option<G>,
+        M: FnMut(&G) -> String,
+    {
+        let variant = match self.variant {
+            ErrorVariant::ParsingError {
+                positives,
+                negatives,
+            } => {
+                let message = Error::grouped_parsing_error_message(
+                    &positives,
+                    &negatives,
+                    &mut classify,
+                    &mut describe,
+                );
+                ErrorVariant::CustomError { message }
+            }
+            variant => variant,
+        };
+
+        self.variant = variant;
+
+        self
+    }
+
     /// Get detailed information about errored rules sequence.
     /// Returns `Some(results)` only for `ParsingError`.
     pub fn parse_attempts(&self) -> Option<ParseAttempts<R>> {
@@ -608,6 +698,88 @@ impl<R: RuleType> Error<R> {
                     .map(f)
                     .collect::<Vec<_>>()
                     .join(", ");
+                format!("{separated}, or {non_separated}")
+            }
+        }
+    }
+
+    fn grouped_parsing_error_message<G, C, M>(
+        positives: &[R],
+        negatives: &[R],
+        classify: &mut C,
+        describe: &mut M,
+    ) -> String
+    where
+        G: Eq,
+        C: FnMut(&R) -> Option<G>,
+        M: FnMut(&G) -> String,
+    {
+        match (negatives.is_empty(), positives.is_empty()) {
+            (false, false) => format!(
+                "unexpected {}; expected {}",
+                Error::enumerate_grouped(negatives, classify, describe),
+                Error::enumerate_grouped(positives, classify, describe)
+            ),
+            (false, true) => format!(
+                "unexpected {}",
+                Error::enumerate_grouped(negatives, classify, describe)
+            ),
+            (true, false) => format!(
+                "expected {}",
+                Error::enumerate_grouped(positives, classify, describe)
+            ),
+            // No information at all: report an unknown parsing error,
+            // never a success hint.
+            (true, true) => "unknown parsing error".to_owned(),
+        }
+    }
+
+    /// Renders `rules` grouped by their category.
+    ///
+    /// Grouping is keyed by the category value (`G`), not by its rendered
+    /// text, so distinct categories with identical descriptions are never
+    /// merged. Groups appear in stable first-seen order and members keep
+    /// their original order and identity. Rules without a category (`None`,
+    /// unknown group) are listed under their original rule name.
+    fn enumerate_grouped<G, C, M>(rules: &[R], classify: &mut C, describe: &mut M) -> String
+    where
+        G: Eq,
+        C: FnMut(&R) -> Option<G>,
+        M: FnMut(&G) -> String,
+    {
+        let mut groups: Vec<(Option<G>, Vec<R>)> = Vec::new();
+        for &rule in rules {
+            let key = classify(&rule);
+            if let Some((_, members)) = groups.iter_mut().find(|(k, _)| *k == key) {
+                members.push(rule);
+            } else {
+                groups.push((key, vec![rule]));
+            }
+        }
+
+        let rendered = groups
+            .into_iter()
+            .map(|(key, members)| {
+                let names = members
+                    .iter()
+                    .map(|rule| format!("{rule:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match key {
+                    Some(group) => format!("{}({})", describe(&group), names),
+                    None => names,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        match rendered.len() {
+            // `rules` is never empty here, but stay total just in case.
+            0 => String::new(),
+            1 => rendered[0].clone(),
+            2 => format!("{} or {}", rendered[0], rendered[1]),
+            l => {
+                let non_separated = &rendered[l - 1];
+                let separated = rendered[..l - 1].join(", ");
                 format!("{separated}, or {non_separated}")
             }
         }
@@ -1127,6 +1299,168 @@ mod tests {
                 "  |  ^---",
                 "  |",
                 "  = unexpected 5, 6, or 7; expected 2, 3, or 4"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[allow(non_camel_case_types)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    enum GroupedRule {
+        identifier,
+        number,
+        keyword,
+        semicolon,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Category {
+        Operand,
+        Literal,
+    }
+
+    /// Failure example 1: `identifier` and `number` are classified into the
+    /// same `operand` group, yet both rule identities stay visible, and the
+    /// negative exclusion (`semicolon`) is reported independently.
+    #[test]
+    fn grouped_parsing_error_keeps_rule_identities() {
+        let input = "ab\ncd\nef";
+        let pos = Position::new(input, 4).unwrap();
+        let error = Error::new_from_pos(
+            ErrorVariant::ParsingError {
+                positives: vec![GroupedRule::identifier, GroupedRule::number],
+                negatives: vec![GroupedRule::semicolon],
+            },
+            pos,
+        )
+        .grouped_rules(
+            |rule| match rule {
+                GroupedRule::identifier | GroupedRule::number => Some("operand"),
+                _ => None,
+            },
+            |group| group.to_string(),
+        );
+
+        // The location still points at the actual line/column within the
+        // input and only the offending line is rendered.
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 2:2",
+                "  |",
+                "2 | cd",
+                "  |  ^---",
+                "  |",
+                "  = unexpected semicolon; expected operand(identifier, number)"
+            ]
+            .join("\n")
+        );
+    }
+
+    /// Failure example 2: two distinct categories whose rendered text is
+    /// identical must not be merged; grouping is keyed by category identity.
+    /// Groups and members keep stable first-seen order.
+    #[test]
+    fn grouped_parsing_error_same_text_categories_not_merged() {
+        let input = "ab\ncd\nef";
+        let pos = Position::new(input, 4).unwrap();
+        let error = Error::new_from_pos(
+            ErrorVariant::ParsingError {
+                positives: vec![
+                    GroupedRule::identifier,
+                    GroupedRule::number,
+                    GroupedRule::keyword,
+                ],
+                negatives: vec![],
+            },
+            pos,
+        )
+        .grouped_rules(
+            |rule| match rule {
+                GroupedRule::identifier | GroupedRule::keyword => Some(Category::Operand),
+                GroupedRule::number => Some(Category::Literal),
+                _ => None,
+            },
+            // Both categories deliberately render to the same text.
+            |_| "value".to_owned(),
+        );
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 2:2",
+                "  |",
+                "2 | cd",
+                "  |  ^---",
+                "  |",
+                "  = expected value(identifier, keyword) or value(number)"
+            ]
+            .join("\n")
+        );
+    }
+
+    /// Failure example 3: rules without a category (unknown group) keep
+    /// their original rule name, and negative exclusions stay independent
+    /// from the positive expectations.
+    #[test]
+    fn grouped_parsing_error_unknown_group_keeps_original_name() {
+        let input = "ab\ncd\nef";
+        let pos = Position::new(input, 4).unwrap();
+        let error = Error::new_from_pos(
+            ErrorVariant::ParsingError {
+                positives: vec![GroupedRule::identifier, GroupedRule::number],
+                negatives: vec![GroupedRule::semicolon, GroupedRule::keyword],
+            },
+            pos,
+        )
+        .grouped_rules(
+            |rule| match rule {
+                GroupedRule::number => Some("operand"),
+                GroupedRule::keyword => Some("forbidden"),
+                _ => None,
+            },
+            |group| group.to_string(),
+        );
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 2:2",
+                "  |",
+                "2 | cd",
+                "  |  ^---",
+                "  |",
+                "  = unexpected semicolon or forbidden(keyword); expected identifier or \
+                 operand(number)"
+            ]
+            .join("\n")
+        );
+    }
+
+    /// An "unknown" parsing error (no positives, no negatives) must stay an
+    /// unknown error; grouping never turns it into a success hint.
+    #[test]
+    fn grouped_parsing_error_unknown_is_not_success() {
+        let input = "ab\ncd\nef";
+        let pos = Position::new(input, 4).unwrap();
+        let error: Error<GroupedRule> = Error::new_from_pos(
+            ErrorVariant::ParsingError {
+                positives: vec![],
+                negatives: vec![],
+            },
+            pos,
+        )
+        .grouped_rules(|_| Some("operand"), |group| group.to_string());
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 2:2",
+                "  |",
+                "2 | cd",
+                "  |  ^---",
+                "  |",
+                "  = unknown parsing error"
             ]
             .join("\n")
         );
