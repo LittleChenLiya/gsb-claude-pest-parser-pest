@@ -1,0 +1,10 @@
+value = { identifier | number }
+identifier = { ASCII_ALPHA+ }
+number = { ASCII_DIGIT+ }
+
+not_keyword = { !keyword ~ identifier }
+keyword = { "if" | "else" }
+
+root = { positive | !negative }
+positive = { "a" }
+negative = { "b" }

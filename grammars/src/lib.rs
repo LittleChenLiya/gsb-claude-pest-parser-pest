@@ -64,6 +64,16 @@ pub mod sql {
     pub struct SqlParser;
 }
 
+/// Grammar rules for testing explicit expected grouping.
+#[allow(missing_docs)]
+pub mod error_test {
+    /// Parser used to verify that positive and negative rules are grouped
+    /// independently while preserving each rule's identity.
+    #[derive(Parser)]
+    #[grammar = "grammars/error_test.pest"]
+    pub struct ErrorTestParser;
+}
+
 #[cfg(test)]
 mod tests {
     use pest::iterators::Pairs;
@@ -72,7 +82,7 @@ mod tests {
     use pest::pratt_parser::PrattParser;
     use pest::Parser;
 
-    use crate::{json, sql, toml};
+    use crate::{error_test, json, sql, toml};
 
     fn test_toml_deep_nesting(input: &str) {
         const ERROR: &str = "call limit reached";
@@ -373,6 +383,103 @@ mod tests {
                 "          - Expected expression.",
             ]
                 .join("\n")
+        );
+    }
+
+    #[test]
+    fn error_test_identifier_number_two_identities() {
+        // Acceptance: identifier and number in the same group still have two identities.
+        pest::set_error_detail(true);
+
+        fn rule_to_message(r: &error_test::Rule) -> Option<String> {
+            match r {
+                error_test::Rule::identifier => Some(String::from("Expected a value.")),
+                error_test::Rule::number => Some(String::from("Expected a value.")),
+                _ => None,
+            }
+        }
+
+        type RuleToMessageBoxed = Box<dyn Fn(&error_test::Rule) -> Option<String>>;
+        type IsWhiteSpaceBoxed = Box<dyn Fn(String) -> bool>;
+
+        let rule_to_message_boxed: RuleToMessageBoxed = Box::new(rule_to_message);
+        let is_whitespace_boxed: IsWhiteSpaceBoxed = Box::new(|s| s.trim().is_empty());
+
+        let e = error_test::ErrorTestParser::parse(error_test::Rule::value, "").unwrap_err();
+        let parse_attempt_error = e
+            .parse_attempts_error("", &rule_to_message_boxed, &is_whitespace_boxed)
+            .unwrap();
+        let output = format!("{parse_attempt_error}");
+
+        // Both identifier and number must appear as two separate identities even
+        // though they translate to the same message. The message should appear twice.
+        let count = output.matches("Expected a value.").count();
+        assert_eq!(count, 2, "expected 2 occurrences, got {count}: {output}");
+    }
+
+    #[test]
+    fn error_test_negative_exclusions_independent() {
+        // Acceptance: negative exclusions are independent.
+        pest::set_error_detail(true);
+
+        fn rule_to_message(r: &error_test::Rule) -> Option<String> {
+            match r {
+                error_test::Rule::not_keyword => Some(String::from("Expected a non-keyword identifier.")),
+                error_test::Rule::identifier => Some(String::from("Expected an identifier.")),
+                _ => None,
+            }
+        }
+
+        type RuleToMessageBoxed = Box<dyn Fn(&error_test::Rule) -> Option<String>>;
+        type IsWhiteSpaceBoxed = Box<dyn Fn(String) -> bool>;
+
+        let rule_to_message_boxed: RuleToMessageBoxed = Box::new(rule_to_message);
+        let is_whitespace_boxed: IsWhiteSpaceBoxed = Box::new(|s| s.trim().is_empty());
+
+        let e = error_test::ErrorTestParser::parse(error_test::Rule::not_keyword, "if").unwrap_err();
+        let parse_attempt_error = e
+            .parse_attempts_error("if", &rule_to_message_boxed, &is_whitespace_boxed)
+            .unwrap();
+        let output = format!("{parse_attempt_error}");
+
+        // The negative exclusion must be shown independently (unexpected token).
+        assert!(
+            output.contains("unexpected"),
+            "expected unexpected token note, output was: {output}"
+        );
+    }
+
+    #[test]
+    fn error_test_positive_negative_same_text_not_merged() {
+        // Acceptance: two categories with the same text do not merge incorrectly.
+        pest::set_error_detail(true);
+
+        fn rule_to_message(r: &error_test::Rule) -> Option<String> {
+            match r {
+                error_test::Rule::positive => Some(String::from("Expected a rule.")),
+                error_test::Rule::negative => Some(String::from("Expected a rule.")),
+                _ => None,
+            }
+        }
+
+        type RuleToMessageBoxed = Box<dyn Fn(&error_test::Rule) -> Option<String>>;
+        type IsWhiteSpaceBoxed = Box<dyn Fn(String) -> bool>;
+
+        let rule_to_message_boxed: RuleToMessageBoxed = Box::new(rule_to_message);
+        let is_whitespace_boxed: IsWhiteSpaceBoxed = Box::new(|s| s.trim().is_empty());
+
+        let e = error_test::ErrorTestParser::parse(error_test::Rule::root, "b").unwrap_err();
+        let parse_attempt_error = e
+            .parse_attempts_error("b", &rule_to_message_boxed, &is_whitespace_boxed)
+            .unwrap();
+        let output = format!("{parse_attempt_error}");
+
+        // Both positive and negative rules must appear independently even though
+        // they translate to the same message.
+        let count = output.matches("Expected a rule.").count();
+        assert!(
+            count >= 2,
+            "expected at least 2 occurrences of the message, got {count}: {output}"
         );
     }
 }

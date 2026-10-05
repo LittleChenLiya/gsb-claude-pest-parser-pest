@@ -186,6 +186,8 @@ pub struct RulesCallStack<R> {
     pub deepest: ParseAttempt<R>,
     /// Most top rule covering `deepest`.
     pub parent: Option<R>,
+    /// Whether this call stack originated from a negative lookahead.
+    pub negative: bool,
 }
 
 impl<R> RulesCallStack<R> {
@@ -193,6 +195,7 @@ impl<R> RulesCallStack<R> {
         RulesCallStack {
             deepest,
             parent: None,
+            negative: false,
         }
     }
 }
@@ -340,7 +343,7 @@ impl<R: RuleType> ParseAttempts<R> {
     ///   is that we'd like to update only those stacks that originated from the current `rule` and
     ///   not from those that were called previously.
     /// * 0 in case we've successfully parsed some token since the moment `rule` was called.
-    fn try_add_new_stack_rule(&mut self, rule: R, start_index: usize) {
+    fn try_add_new_stack_rule(&mut self, rule: R, start_index: usize, negative: bool) {
         let mut non_token_call_stacks = Vec::new();
         let mut token_call_stack_met = false;
         for call_stack in self.call_stacks.iter().skip(start_index) {
@@ -351,10 +354,9 @@ impl<R: RuleType> ParseAttempts<R> {
             }
         }
         if token_call_stack_met && non_token_call_stacks.is_empty() {
-            // If `non_token_call_stacks` is not empty we wouldn't like to add a new standalone
-            // `RulesCallStack::new(ParseAttempt::Token)` (that will later be transformed into a
-            // rule) as soon as it doesn't give us any useful additional info.
-            non_token_call_stacks.push(RulesCallStack::new(ParseAttempt::Token));
+            let mut new_stack = RulesCallStack::new(ParseAttempt::Token);
+            new_stack.negative = negative;
+            non_token_call_stacks.push(new_stack);
         }
         self.call_stacks
             .splice(start_index.., non_token_call_stacks);
@@ -363,14 +365,17 @@ impl<R: RuleType> ParseAttempts<R> {
             self.call_stacks_number() - start_index >= CALL_STACK_CHILDREN_THRESHOLD;
         if children_number_over_threshold {
             self.call_stacks.truncate(start_index);
-            self.call_stacks
-                .push(RulesCallStack::new(ParseAttempt::Rule(rule)));
+            let mut new_stack = RulesCallStack::new(ParseAttempt::Rule(rule));
+            new_stack.negative = negative;
+            self.call_stacks.push(new_stack);
         } else {
             for call_stack in self.call_stacks.iter_mut().skip(start_index) {
                 if matches!(call_stack.deepest, ParseAttempt::Token) {
                     call_stack.deepest = ParseAttempt::Rule(rule);
+                    call_stack.negative = negative;
                 } else {
                     call_stack.parent = Some(rule);
+                    call_stack.negative = negative;
                 }
             }
         }
@@ -412,18 +417,25 @@ impl<R: RuleType> ParseAttempts<R> {
             if negative_lookahead {
                 // In case of successful parsing of token under negative lookahead the only
                 // thing we'd like to do is to track the token in the `unexpected_tokens`.
+                // We also create a token call stack so that the enclosing negative rule can
+                // be tracked as a distinct attempt (preserving its identity).
+                let mut new_stack = RulesCallStack::new(ParseAttempt::Token);
+                new_stack.negative = true;
+                self.call_stacks.push(new_stack);
                 return;
             }
             self.max_position = position;
             self.expected_tokens.clear();
             self.unexpected_tokens.clear();
             self.call_stacks.clear();
-            self.call_stacks
-                .push(RulesCallStack::new(ParseAttempt::Token));
+            let mut new_stack = RulesCallStack::new(ParseAttempt::Token);
+            new_stack.negative = negative_lookahead;
+            self.call_stacks.push(new_stack);
         } else if position == self.max_position {
             target_vec_push_token(self);
-            self.call_stacks
-                .push(RulesCallStack::new(ParseAttempt::Token));
+            let mut new_stack = RulesCallStack::new(ParseAttempt::Token);
+            new_stack.negative = negative_lookahead;
+            self.call_stacks.push(new_stack);
         }
     }
 
@@ -696,6 +708,8 @@ impl<'i, R: RuleType> ParserState<'i, R> {
         // It case it's raised during children rules handling, it means
         // we've made a parsing progress.
         let remember_max_position = self.parse_attempts.max_position;
+        // Whether this rule is being tried under a negative lookahead.
+        let is_negative = self.lookahead == Lookahead::Negative;
 
         let result = f(self);
 
@@ -709,7 +723,7 @@ impl<'i, R: RuleType> ParserState<'i, R> {
             if !matches!(new_state.atomicity, Atomicity::Atomic) {
                 new_state
                     .parse_attempts
-                    .try_add_new_stack_rule(rule, remember_call_stacks_number);
+                    .try_add_new_stack_rule(rule, remember_call_stacks_number, is_negative);
             }
         };
 

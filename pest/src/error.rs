@@ -17,7 +17,6 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
 use core::fmt;
@@ -113,58 +112,6 @@ impl ParsingToken {
             ParsingToken::Range { .. } => false,
             ParsingToken::BuiltInRule => false,
         }
-    }
-}
-
-impl<R: RuleType> ParseAttempts<R> {
-    /// Helper formatting function to get message informing about tokens we've
-    /// (un)expected to see.
-    /// Used as a part of `parse_attempts_error`.
-    fn tokens_helper_messages(
-        &self,
-        is_whitespace_fn: &IsWhitespaceFn,
-        spacing: &str,
-    ) -> Vec<String> {
-        let mut helper_messages = Vec::new();
-        let tokens_header_pairs = vec![
-            (self.expected_tokens(), "expected"),
-            (self.unexpected_tokens(), "unexpected"),
-        ];
-
-        for (tokens, header) in &tokens_header_pairs {
-            if tokens.is_empty() {
-                continue;
-            }
-
-            let mut helper_tokens_message = format!("{spacing}note: {header} ");
-            helper_tokens_message.push_str(if tokens.len() == 1 {
-                "token: "
-            } else {
-                "one of tokens: "
-            });
-
-            let expected_tokens_set: BTreeSet<String> = tokens
-                .iter()
-                .map(|token| {
-                    if token.is_whitespace(is_whitespace_fn) {
-                        String::from("WHITESPACE")
-                    } else {
-                        format!("`{token}`")
-                    }
-                })
-                .collect();
-
-            helper_tokens_message.push_str(
-                &expected_tokens_set
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<String>>()
-                    .join(", "),
-            );
-            helper_messages.push(helper_tokens_message);
-        }
-
-        helper_messages
     }
 }
 
@@ -443,60 +390,72 @@ impl<R: RuleType> Error<R> {
             let mut help_lines: Vec<String> = Vec::new();
             help_lines.push(String::from("error: parsing error occurred."));
 
-            // Note: at least one of `(un)expected_tokens` must not be empty.
-            for tokens_helper_message in attempts.tokens_helper_messages(is_whitespace, &spacing) {
-                help_lines.push(tokens_helper_message);
-            }
-
             let call_stacks = attempts.call_stacks();
-            // Group call stacks by their parents so that we can print common header and
-            // several sub helper messages.
-            let mut call_stacks_parents_groups: BTreeMap<Option<R>, Vec<RulesCallStack<R>>> =
+
+            // Separate positive and negative call stacks so that each category is shown
+            // independently without merging distinct constraints.
+            let (positive_stacks, negative_stacks): (Vec<_>, Vec<_>) =
+                call_stacks.into_iter().partition(|cs| !cs.negative);
+
+            // Group call stacks by their parent rule, preserving each rule's identity.
+            let mut positive_groups: BTreeMap<Option<R>, Vec<RulesCallStack<R>>> =
                 BTreeMap::new();
-            for call_stack in call_stacks {
-                call_stacks_parents_groups
+            for call_stack in positive_stacks {
+                positive_groups
                     .entry(call_stack.parent)
                     .or_default()
                     .push(call_stack);
             }
 
-            for (group_parent, group) in call_stacks_parents_groups {
-                if let Some(parent_rule) = group_parent {
-                    let mut contains_meaningful_info = false;
-                    help_lines.push(format!(
-                        "{spacing}help: {}",
-                        if let Some(message) = rule_to_message(&parent_rule) {
-                            contains_meaningful_info = true;
-                            message
-                        } else {
-                            String::from("[Unknown parent rule]")
-                        }
-                    ));
-                    for call_stack in group {
-                        if let Some(r) = call_stack.deepest.get_rule() {
-                            if let Some(message) = rule_to_message(r) {
-                                contains_meaningful_info = true;
-                                help_lines.push(format!("{spacing}      - {message}"));
-                            }
-                        }
-                    }
-                    if !contains_meaningful_info {
-                        // Have to remove useless line for unknown parent rule.
-                        help_lines.pop();
-                    }
-                } else {
-                    for call_stack in group {
-                        // Note that `deepest` rule may be `None`. E.g. in case it corresponds
-                        // to WHITESPACE expected token which has no parent rule (on the top level
-                        // parsing).
-                        if let Some(r) = call_stack.deepest.get_rule() {
-                            let helper_message = rule_to_message(r);
-                            if let Some(helper_message) = helper_message {
-                                help_lines.push(format!("{spacing}help: {helper_message}"));
-                            }
-                        }
-                    }
-                }
+            let mut negative_groups: BTreeMap<Option<R>, Vec<RulesCallStack<R>>> =
+                BTreeMap::new();
+            for call_stack in negative_stacks {
+                negative_groups
+                    .entry(call_stack.parent)
+                    .or_default()
+                    .push(call_stack);
+            }
+
+            // Expected tokens note.
+            if let Some(note) = format_tokens_note(
+                &attempts.expected_tokens(),
+                "expected",
+                is_whitespace,
+                &spacing,
+            ) {
+                help_lines.push(note);
+            }
+
+            // Unexpected tokens note.
+            if let Some(note) = format_tokens_note(
+                &attempts.unexpected_tokens(),
+                "unexpected",
+                is_whitespace,
+                &spacing,
+            ) {
+                help_lines.push(note);
+            }
+
+            // Positive call stack groups.
+            for (group_parent, group) in &positive_groups {
+                format_call_stack_group(
+                    &mut help_lines,
+                    group_parent,
+                    group,
+                    rule_to_message,
+                    &spacing,
+                );
+            }
+
+            // Negative call stack groups.
+            for (group_parent, group) in &negative_groups {
+                format_call_stack_group(
+                    &mut help_lines,
+                    group_parent,
+                    group,
+                    rule_to_message,
+                    &spacing,
+                );
             }
 
             help_lines.join("\n")
@@ -690,6 +649,93 @@ impl<R: RuleType> Error<R> {
     /// Turns an error into a [miette](crates.io/miette) Diagnostic.
     pub fn into_miette(self) -> impl ::miette::Diagnostic {
         miette_adapter::MietteAdapter(self)
+    }
+}
+
+/// Formats a note about expected or unexpected tokens.
+fn format_tokens_note(
+    tokens: &[ParsingToken],
+    header: &str,
+    is_whitespace_fn: &IsWhitespaceFn,
+    spacing: &str,
+) -> Option<String> {
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut helper_message = format!("{spacing}note: {header} ");
+    helper_message.push_str(if tokens.len() == 1 {
+        "token: "
+    } else {
+        "one of tokens: "
+    });
+
+    let tokens_set: BTreeSet<String> = tokens
+        .iter()
+        .map(|token| {
+            if token.is_whitespace(is_whitespace_fn) {
+                String::from("WHITESPACE")
+            } else {
+                format!("`{token}`")
+            }
+        })
+        .collect();
+
+    helper_message.push_str(
+        &tokens_set
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(", "),
+    );
+    Some(helper_message)
+}
+
+/// Formats a group of call stacks sharing the same parent rule.
+///
+/// Positive and negative groups are displayed independently so that distinct
+/// constraints are never merged after translation. Unknown parent rules keep
+/// their original name (via `Debug`) instead of a placeholder, and are not
+/// shown with a "help:" prompt.
+fn format_call_stack_group<R: RuleType>(
+    help_lines: &mut Vec<String>,
+    group_parent: &Option<R>,
+    group: &[RulesCallStack<R>],
+    rule_to_message: &RuleToMessageFn<R>,
+    spacing: &str,
+) {
+    match group_parent {
+        Some(parent_rule) => {
+            match rule_to_message(parent_rule) {
+                Some(message) => {
+                    help_lines.push(format!("{spacing}help: {message}"));
+                }
+                None => {
+                    // Unknown rule: keep the original name, but do not show a
+                    // "help:" prompt since there is no helpful suggestion.
+                    help_lines.push(format!("{spacing}note: {parent_rule:?}"));
+                }
+            }
+            for call_stack in group {
+                if let Some(r) = call_stack.deepest.get_rule() {
+                    if let Some(message) = rule_to_message(r) {
+                        help_lines.push(format!("{spacing}      - {message}"));
+                    }
+                }
+            }
+        }
+        None => {
+            for call_stack in group {
+                // Note that `deepest` rule may be `None`. E.g. in case it corresponds
+                // to WHITESPACE expected token which has no parent rule (on the top level
+                // parsing).
+                if let Some(r) = call_stack.deepest.get_rule() {
+                    if let Some(message) = rule_to_message(r) {
+                        help_lines.push(format!("{spacing}help: {message}"));
+                    }
+                }
+            }
+        }
     }
 }
 
