@@ -20,6 +20,7 @@ use core::str;
 #[cfg(feature = "pretty-print")]
 use serde::ser::SerializeStruct;
 
+use super::filtered_pairs::{self, FilteredPairs};
 use super::flat_pairs::{self, FlatPairs};
 use super::line_index::LineIndex;
 use super::pair::{self, Pair};
@@ -221,6 +222,69 @@ impl<'i, R: RuleType> Pairs<'i, R> {
             self.line_index,
             self.start,
             self.end,
+        )
+    }
+
+    /// Returns a read-only projection of these `Pairs`, selecting a single `rule`.
+    ///
+    /// The returned [`FilteredPairs`] iterator yields only the existing [`Pair`]s
+    /// whose subtree contains at least one pair of `rule`: matching pairs are kept
+    /// together with the ancestors needed to reach them, so the original parent
+    /// path and [`Span`] of every yielded pair are preserved. Nested pairs of the
+    /// same rule are shared with the originating `Pairs` by identity and are never
+    /// merged. Nothing is re-parsed and no tokens are fabricated, so rules that
+    /// produced no tokens (such as silent rules) cannot appear in the projection.
+    ///
+    /// Descend with [`Pair::into_inner`] and `select` again to walk from the kept
+    /// ancestors down to the matching pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::rc::Rc;
+    /// # use pest;
+    /// # #[allow(non_camel_case_types)]
+    /// # #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    /// enum Rule {
+    ///     expr,
+    ///     number
+    /// }
+    ///
+    /// let input = "1";
+    /// let pairs = pest::state(input, |state| {
+    ///     // generating Token pair with Rule::number nested in Rule::expr ...
+    /// #     state.rule(Rule::expr, |s| {
+    /// #         s.rule(Rule::number, |s| s.match_string("1"))
+    /// #     })
+    /// }).unwrap();
+    ///
+    /// // `expr` does not match `number` itself, but it is kept as the parent
+    /// // path of the matching `number`.
+    /// let mut projection = pairs.select(Rule::number);
+    /// let expr = projection.next().unwrap();
+    /// assert_eq!(expr.as_rule(), Rule::expr);
+    /// assert!(projection.next().is_none());
+    ///
+    /// let mut inner = expr.into_inner().select(Rule::number);
+    /// let number = inner.next().unwrap();
+    /// assert_eq!(number.as_rule(), Rule::number);
+    /// assert_eq!(number.as_str(), "1");
+    /// assert!(inner.next().is_none());
+    /// ```
+    ///
+    /// [`Pair`]: struct.Pair.html
+    /// [`Pair::into_inner`]: struct.Pair.html#method.into_inner
+    /// [`FilteredPairs`]: struct.FilteredPairs.html
+    /// [`Span`]: ../struct.Span.html
+    #[inline]
+    pub fn select(self, rule: R) -> FilteredPairs<'i, R> {
+        filtered_pairs::new(
+            self.queue,
+            self.input,
+            self.line_index,
+            self.start,
+            self.end,
+            rule,
         )
     }
 
