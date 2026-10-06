@@ -1,0 +1,10 @@
+// Small grammar for `Pair` projection tests.
+//
+// Three levels from `expr` down to `number`, a nested same-rule path
+// (`expr` inside `expr` through parentheses) and a silent rule
+// (`WHITESPACE`) that must never appear in a projection.
+expr   = { term ~ (op ~ term)* }
+term   = { number | "(" ~ expr ~ ")" }
+number = { ASCII_DIGIT+ }
+op     = { "+" | "-" }
+WHITESPACE = _{ " " }

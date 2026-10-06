@@ -23,6 +23,7 @@ use serde::ser::SerializeStruct;
 
 use super::line_index::LineIndex;
 use super::pairs::{self, Pairs};
+use super::projection::PairProjection;
 use super::queueable_token::QueueableToken;
 use super::tokens::{self, Tokens};
 use crate::span::Span;
@@ -277,6 +278,39 @@ impl<'i, R: RuleType> Pair<'i, R> {
         let end = self.pair();
 
         tokens::new(self.queue, self.input, self.start, end + 1)
+    }
+
+    /// Creates a read-only projection of this `Pair`, filtered by `rule`.
+    ///
+    /// The projection is a view over the existing pairs: it keeps the pairs
+    /// matching `rule` together with the ancestor pairs needed to reach them,
+    /// preserving the original spans and pair identities. Nothing is
+    /// re-parsed and no tokens are fabricated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::rc::Rc;
+    /// # use pest;
+    /// # #[allow(non_camel_case_types)]
+    /// # #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    /// enum Rule {
+    ///     a,
+    ///     b
+    /// }
+    ///
+    /// let input = "ab";
+    /// let pair = pest::state(input, |state| {
+    ///     // generating Token pair a(b()) ...
+    /// #     state.rule(Rule::a, |s| s.match_string("a").and_then(|s| s.rule(Rule::b, |s| s.match_string("b"))))
+    /// }).unwrap().next().unwrap();
+    ///
+    /// let view = pair.project(Rule::b);
+    /// assert_eq!(view.matching().count(), 1);
+    /// ```
+    #[inline]
+    pub fn project(&self, rule: R) -> PairProjection<'i, R> {
+        PairProjection::new(self.clone(), rule)
     }
 
     /// Generates a string that stores the lexical information of `self` in
