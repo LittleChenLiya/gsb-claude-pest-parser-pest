@@ -20,6 +20,7 @@ use core::str;
 #[cfg(feature = "pretty-print")]
 use serde::ser::SerializeStruct;
 
+use super::events::{self, Events};
 use super::flat_pairs::{self, FlatPairs};
 use super::line_index::LineIndex;
 use super::pair::{self, Pair};
@@ -330,6 +331,52 @@ impl<'i, R: RuleType> Pairs<'i, R> {
     ) -> Filter<FlatPairs<'i, R>, impl FnMut(&Pair<'i, R>) -> bool + 'i> {
         self.flatten()
             .filter(move |pair: &Pair<'i, R>| matches!(pair.as_node_tag(), Some(nt) if nt == tag))
+    }
+
+    /// Returns an iterator over the [`Event`]s of the `Pairs`, exposing the start and end
+    /// markers of every matched rule together with its `Rule` and `Span`.
+    ///
+    /// Events are emitted in tree nesting (document) order, and every rule — including rules
+    /// that matched an empty slice of the input — produces a [`Event::Start`]/[`Event::End`]
+    /// pair. The iterator only shares the token queue of `self`, so stopping the iteration
+    /// early leaves the original `Pairs` untouched.
+    ///
+    /// [`Event`]: enum.Event.html
+    /// [`Event::Start`]: enum.Event.html#variant.Start
+    /// [`Event::End`]: enum.Event.html#variant.End
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::rc::Rc;
+    /// # use pest;
+    /// # use pest::iterators::Event;
+    /// # #[allow(non_camel_case_types)]
+    /// # #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    /// enum Rule {
+    ///     a,
+    ///     b
+    /// }
+    ///
+    /// let input = "";
+    /// let pairs = pest::state(input, |state| {
+    ///     // generating nested Token pair with Rule::b inside Rule::a
+    /// #     state.rule(Rule::a, |state| {
+    /// #         state.rule(Rule::b, |s| Ok(s))
+    /// #     })
+    /// }).unwrap();
+    /// let events: Vec<_> = pairs.events().collect();
+    ///
+    /// assert_eq!(
+    ///     events.iter().map(|e| (e.as_rule(), e.as_span().as_str())).collect::<Vec<_>>(),
+    ///     vec![(Rule::a, ""), (Rule::b, ""), (Rule::b, ""), (Rule::a, "")]
+    /// );
+    /// assert!(matches!(events[0], Event::Start { rule: Rule::a, .. }));
+    /// assert!(matches!(events[3], Event::End { rule: Rule::a, .. }));
+    /// ```
+    #[inline]
+    pub fn events(&self) -> Events<'i, R> {
+        events::new(Rc::clone(&self.queue), self.input, self.start, self.end)
     }
 
     /// Returns the `Tokens` for the `Pairs`.
