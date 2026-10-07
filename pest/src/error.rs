@@ -46,7 +46,25 @@ struct ErrorInner<R> {
     line: String,
     continued_line: Option<String>,
     parse_attempts: Option<ParseAttempts<R>>,
+    /// Tab width (in display columns) used when rendering the error.
+    /// `None` keeps the legacy behavior of copying tabs through verbatim.
+    tab_width: Option<usize>,
 }
+
+/// Error returned when an invalid tab width is passed to
+/// [`Error::with_tab_width`].
+///
+/// Tab width must be greater than zero.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InvalidTabWidthError;
+
+impl fmt::Display for InvalidTabWidthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tab width must be greater than zero")
+    }
+}
+
+impl core::error::Error for InvalidTabWidthError {}
 
 impl<R: RuleType> core::error::Error for Error<R> {}
 
@@ -212,6 +230,7 @@ impl<R: RuleType> Error<R> {
                 line,
                 continued_line: None,
                 parse_attempts: None,
+                tab_width: None,
             }),
         }
     }
@@ -293,6 +312,7 @@ impl<R: RuleType> Error<R> {
                 line: start_line,
                 continued_line,
                 parse_attempts: None,
+                tab_width: None,
             }),
         }
     }
@@ -354,6 +374,70 @@ impl<R: RuleType> Error<R> {
     /// ```
     pub fn path(&self) -> Option<&str> {
         self.inner.path.as_deref()
+    }
+
+    /// Returns `Error` with a custom tab width used when rendering it with
+    /// `Display`.
+    ///
+    /// Tabs in the rendered line are expanded to the next multiple of
+    /// `width` display columns, and the caret/underline is placed according
+    /// to the resulting display columns. The reported byte location
+    /// ([`Error::location`]) and the line/column pair ([`Error::line_col`],
+    /// which follows [`Position::line_col`] semantics, i.e. one column per
+    /// `char` regardless of its display width) are left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidTabWidthError`] if `width` is zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pest::error::{Error, ErrorVariant};
+    /// # use pest::Position;
+    /// # #[allow(non_camel_case_types)]
+    /// # #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    /// # enum Rule {
+    /// #     open_paren,
+    /// #     closed_paren
+    /// # }
+    /// let input = "\tx";
+    /// let pos = Position::new(input, 1).unwrap();
+    /// let error = Error::<Rule>::new_from_pos(
+    ///     ErrorVariant::ParsingError {
+    ///         positives: vec![Rule::open_paren],
+    ///         negatives: vec![],
+    ///     },
+    ///     pos,
+    /// )
+    /// .with_tab_width(4)
+    /// .unwrap();
+    ///
+    /// assert_eq!(
+    ///     format!("{error}"),
+    ///     [
+    ///         " --> 1:2",
+    ///         "  |",
+    ///         "1 |     x",
+    ///         "  |     ^---",
+    ///         "  |",
+    ///         "  = expected open_paren"
+    ///     ]
+    ///     .join("\n")
+    /// );
+    /// ```
+    pub fn with_tab_width(mut self, width: usize) -> Result<Error<R>, InvalidTabWidthError> {
+        if width == 0 {
+            return Err(InvalidTabWidthError);
+        }
+        self.inner.tab_width = Some(width);
+
+        Ok(self)
+    }
+
+    /// Returns the tab width set using [`Error::with_tab_width()`], if any.
+    pub fn tab_width(&self) -> Option<usize> {
+        self.inner.tab_width
     }
 
     /// Returns the line that the error is on.
@@ -548,6 +632,33 @@ impl<R: RuleType> Error<R> {
             }
             _ => None,
         };
+
+        if let Some(tab_width) = self.inner.tab_width {
+            // Place the caret by display column, expanding tabs to the next
+            // multiple of `tab_width`. All other characters keep the
+            // `Position::line_col` semantics of one column per `char`.
+            let offset = display_column(&self.inner.line, start - 1, tab_width);
+            for _ in 0..offset {
+                underline.push(' ');
+            }
+
+            if let Some(end) = end {
+                let end_display = display_column(&self.inner.line, end - 1, tab_width);
+                let width = end_display.saturating_sub(offset);
+                underline.push('^');
+                if width > 1 {
+                    for _ in 2..width {
+                        underline.push('-');
+                    }
+                    underline.push('^');
+                }
+            } else {
+                underline.push_str("^---")
+            }
+
+            return underline;
+        }
+
         let offset = start - 1;
         let line_chars = self.inner.line.chars();
 
@@ -571,6 +682,15 @@ impl<R: RuleType> Error<R> {
         }
 
         underline
+    }
+
+    /// Returns the line as it should be displayed, expanding tabs when a
+    /// tab width has been set with [`Error::with_tab_width`].
+    fn display_line<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        match self.inner.tab_width {
+            Some(tab_width) => Cow::Owned(expand_tabs(line, tab_width)),
+            None => Cow::Borrowed(line),
+        }
     }
 
     fn message(&self) -> String {
@@ -621,9 +741,11 @@ impl<R: RuleType> Error<R> {
             .as_ref()
             .map(|path| format!("{path}:"))
             .unwrap_or_default();
+        let line = self.display_line(&self.inner.line);
 
         let pair = (self.line_col.clone(), &self.inner.continued_line);
         if let (LineColLocation::Span(_, end), Some(ref continued_line)) = pair {
+            let continued_line = self.display_line(continued_line);
             let has_line_gap = end.0 - self.start().0 > 1;
             if has_line_gap {
                 format!(
@@ -641,7 +763,7 @@ impl<R: RuleType> Error<R> {
                     ls = self.start().0,
                     le = end.0,
                     c = self.start().1,
-                    line = self.inner.line,
+                    line = line,
                     continued_line = continued_line,
                     underline = self.underline(),
                     message = self.message()
@@ -661,7 +783,7 @@ impl<R: RuleType> Error<R> {
                     ls = self.start().0,
                     le = end.0,
                     c = self.start().1,
-                    line = self.inner.line,
+                    line = line,
                     continued_line = continued_line,
                     underline = self.underline(),
                     message = self.message()
@@ -679,7 +801,7 @@ impl<R: RuleType> Error<R> {
                 p = path,
                 l = self.start().0,
                 c = self.start().1,
-                line = self.inner.line,
+                line = line,
                 underline = self.underline(),
                 message = self.message()
             )
@@ -746,6 +868,44 @@ impl<R: RuleType> fmt::Display for ErrorVariant<R> {
 
 fn visualize_whitespace(input: &str) -> String {
     input.to_owned().replace('\r', "␍").replace('\n', "␊")
+}
+
+/// Expands tabs in `line` to the next multiple of `tab_width` display
+/// columns. Every other character is kept as-is and advances the display
+/// column by one, matching the `Position::line_col` semantics of one
+/// column per `char` (multi-byte characters are not double-width).
+fn expand_tabs(line: &str, tab_width: usize) -> String {
+    let mut expanded = String::with_capacity(line.len());
+    let mut col = 0;
+    for c in line.chars() {
+        match c {
+            '\t' => {
+                let spaces = tab_width - (col % tab_width);
+                for _ in 0..spaces {
+                    expanded.push(' ');
+                }
+                col += spaces;
+            }
+            _ => {
+                expanded.push(c);
+                col += 1;
+            }
+        }
+    }
+    expanded
+}
+
+/// Returns the display column (0-based) of the character at `char_idx`
+/// in `line`, expanding tabs to the next multiple of `tab_width`.
+fn display_column(line: &str, char_idx: usize, tab_width: usize) -> usize {
+    let mut col = 0;
+    for c in line.chars().take(char_idx) {
+        match c {
+            '\t' => col += tab_width - (col % tab_width),
+            _ => col += 1,
+        }
+    }
+    col
 }
 
 #[cfg(feature = "miette-error")]
@@ -1183,6 +1343,188 @@ mod tests {
                 "  = unexpected 4, 5, or 6; expected 1, 2, or 3"
             ]
             .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_with_tab_width_4() {
+        // Two-line input with tabs around multi-byte (Chinese) characters.
+        let input = "\t我\t\n\t中\t";
+        // Byte position of `中` on the second line.
+        let pos = Position::new(input, 7).unwrap();
+        let error: Error<u32> = Error::new_from_pos(
+            ErrorVariant::ParsingError {
+                positives: vec![1, 2, 3],
+                negatives: vec![4, 5, 6],
+            },
+            pos,
+        )
+        .with_tab_width(4)
+        .unwrap();
+
+        // Internal byte location and line/col are unchanged.
+        assert_eq!(error.location, InputLocation::Pos(7));
+        assert_eq!(error.line_col, LineColLocation::Pos((2, 2)));
+        assert_eq!(error.tab_width(), Some(4));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 2:2",
+                "  |",
+                "2 |     中   ",
+                "  |     ^---",
+                "  |",
+                "  = unexpected 4, 5, or 6; expected 1, 2, or 3"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_with_tab_width_2() {
+        let input = "\t我\t\n\t中\t";
+        let pos = Position::new(input, 7).unwrap();
+        let error: Error<u32> = Error::new_from_pos(
+            ErrorVariant::ParsingError {
+                positives: vec![1, 2, 3],
+                negatives: vec![4, 5, 6],
+            },
+            pos,
+        )
+        .with_tab_width(2)
+        .unwrap();
+
+        assert_eq!(error.location, InputLocation::Pos(7));
+        assert_eq!(error.line_col, LineColLocation::Pos((2, 2)));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 2:2",
+                "  |",
+                "2 |   中 ",
+                "  |   ^---",
+                "  |",
+                "  = unexpected 4, 5, or 6; expected 1, 2, or 3"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_with_tab_width_crlf() {
+        // CRLF line endings keep the existing `Position` semantics.
+        let input = "\ta\r\nb\t中";
+        // Byte position of `中` on the second line.
+        let pos = Position::new(input, 6).unwrap();
+        let error: Error<u32> = Error::new_from_pos(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            pos,
+        )
+        .with_tab_width(4)
+        .unwrap();
+
+        assert_eq!(error.location, InputLocation::Pos(6));
+        assert_eq!(error.line_col, LineColLocation::Pos((2, 3)));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 2:3",
+                "  |",
+                "2 | b   中",
+                "  |     ^---",
+                "  |",
+                "  = error: big one"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_span_two_lines_with_tab_width() {
+        let input = "\t我\t\n\t中\t";
+        let start = Position::new(input, 0).unwrap();
+        let end = Position::new(input, 10).unwrap();
+        let error: Error<u32> = Error::new_from_span(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            start.span(&end),
+        )
+        .with_tab_width(4)
+        .unwrap();
+
+        // Byte range of the span is unchanged.
+        assert_eq!(error.location, InputLocation::Span((0, 10)));
+        assert_eq!(error.line_col, LineColLocation::Span((1, 1), (2, 3)));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 1:1",
+                "  |",
+                "1 |     我   ",
+                "2 |     中   ",
+                "  | ^---^",
+                "  |",
+                "  = error: big one"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_span_three_lines_with_tab_width_keeps_ellipsis() {
+        let input = "\t我\nab\n\t中";
+        let start = Position::new(input, 0).unwrap();
+        let end = Position::new(input, 12).unwrap();
+        let error: Error<u32> = Error::new_from_span(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            start.span(&end),
+        )
+        .with_tab_width(2)
+        .unwrap();
+
+        assert_eq!(error.location, InputLocation::Span((0, 12)));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 1:1",
+                "  |",
+                "1 |   我",
+                "  | ...",
+                "3 |   中",
+                "  | ^-^",
+                "  |",
+                "  = error: big one"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn tab_width_zero_is_rejected() {
+        let input = "\t我";
+        let pos = Position::new(input, 0).unwrap();
+        let error: Error<u32> = Error::new_from_pos(
+            ErrorVariant::ParsingError {
+                positives: vec![1, 2, 3],
+                negatives: vec![4, 5, 6],
+            },
+            pos,
+        );
+
+        assert_eq!(Err(InvalidTabWidthError), error.with_tab_width(0));
+        assert_eq!(
+            InvalidTabWidthError.to_string(),
+            "tab width must be greater than zero"
         );
     }
 
