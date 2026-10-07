@@ -9,6 +9,7 @@
 
 //! Types and iterators for parser output.
 
+mod events;
 mod flat_pairs;
 mod line_index;
 mod pair;
@@ -17,6 +18,7 @@ mod pairs_builder;
 mod queueable_token;
 mod tokens;
 
+pub use self::events::{Events, TokenEvent};
 pub use self::flat_pairs::FlatPairs;
 pub use self::pair::Pair;
 pub use self::pairs::Pairs;
