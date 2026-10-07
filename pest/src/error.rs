@@ -46,6 +46,7 @@ struct ErrorInner<R> {
     line: String,
     continued_line: Option<String>,
     parse_attempts: Option<ParseAttempts<R>>,
+    tab_width: Option<usize>,
 }
 
 impl<R: RuleType> core::error::Error for Error<R> {}
@@ -212,6 +213,7 @@ impl<R: RuleType> Error<R> {
                 line,
                 continued_line: None,
                 parse_attempts: None,
+                tab_width: None,
             }),
         }
     }
@@ -293,6 +295,7 @@ impl<R: RuleType> Error<R> {
                 line: start_line,
                 continued_line,
                 parse_attempts: None,
+                tab_width: None,
             }),
         }
     }
@@ -327,6 +330,63 @@ impl<R: RuleType> Error<R> {
         self
     }
 
+    /// Sets the tab width (number of spaces a tab is displayed as) used when
+    /// formatting this error with [`Display`].
+    ///
+    /// By default tabs are rendered verbatim and the underline is aligned using
+    /// raw character columns, which does not line up with the tab stops of most
+    /// terminals. Once a tab width is set, tabs are expanded into spaces and the
+    /// caret position as well as the `line:column` header are reported in
+    /// *display columns* (see [`Position::line_col`] for the unmodified
+    /// character/byte based semantics).
+    ///
+    /// This only affects the rendered error: the internal byte position reported
+    /// by [`Error::location`] and the character columns of
+    /// [`Error::line_col`] are never modified. Multibyte characters and CRLF
+    /// line endings keep the existing [`Position`] semantics, and spans that skip
+    /// lines continue to be shown with the original `...` omission.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `tab_width` is zero, since a tab stop of zero cannot be
+    /// displayed.
+    ///
+    /// [`Display`]: std::fmt::Display
+    /// [`Position::line_col`]: struct.Position.html#method.line_col
+    /// [`Error::location`]: struct.Error.html#structfield.location
+    /// [`Error::line_col`]: struct.Error.html#structfield.line_col
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pest::error::{Error, ErrorVariant};
+    /// # use pest::Position;
+    /// # #[allow(non_camel_case_types)]
+    /// # #[allow(dead_code)]
+    /// # #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    /// # enum Rule {
+    /// #     open_paren
+    /// # }
+    /// # let input = "a\tb";
+    /// # let pos = Position::new(input, 2).unwrap();
+    /// let error = Error::new_from_pos(
+    ///     ErrorVariant::ParsingError {
+    ///         positives: vec![Rule::open_paren],
+    ///         negatives: vec![],
+    ///     },
+    ///     pos
+    /// )
+    /// .with_tab_width(4);
+    ///
+    /// println!("{}", error);
+    /// ```
+    pub fn with_tab_width(mut self, tab_width: usize) -> Error<R> {
+        assert!(tab_width > 0, "tab width must not be zero");
+        self.inner.tab_width = Some(tab_width);
+
+        self
+    }
+
     /// Returns the path set using [`Error::with_path()`].
     ///
     /// # Examples
@@ -354,6 +414,14 @@ impl<R: RuleType> Error<R> {
     /// ```
     pub fn path(&self) -> Option<&str> {
         self.inner.path.as_deref()
+    }
+
+    /// Returns the tab width set using [`Error::with_tab_width()`], if any.
+    ///
+    /// When `None`, tabs are rendered verbatim using the historical character
+    /// column alignment.
+    pub fn tab_width(&self) -> Option<usize> {
+        self.inner.tab_width
     }
 
     /// Returns the line that the error is on.
@@ -540,7 +608,7 @@ impl<R: RuleType> Error<R> {
                 let inverted_cols = start > end;
                 if inverted_cols {
                     mem::swap(&mut start, &mut end);
-                    start -= 1;
+                    start = start.saturating_sub(1);
                     end += 1;
                 }
 
@@ -548,22 +616,69 @@ impl<R: RuleType> Error<R> {
             }
             _ => None,
         };
-        let offset = start - 1;
-        let line_chars = self.inner.line.chars();
 
-        for c in line_chars.take(offset) {
-            match c {
-                '\t' => underline.push('\t'),
-                _ => underline.push(' '),
+        let tab_width = self.inner.tab_width;
+        let same_line = match self.line_col {
+            LineColLocation::Pos(_) => true,
+            LineColLocation::Span((start_line, _), (end_line, _)) => start_line == end_line,
+        };
+
+        // Offset up to the first marker. Without a tab width tabs are echoed as
+        // tabs (historical behavior); with a tab width spaces are emitted up to
+        // the marker's display column so the caret aligns with the expanded line.
+        let visual_end = match (tab_width, end) {
+            (Some(tab_width), Some(end)) => {
+                let reference = match self.line_col {
+                    LineColLocation::Span((start_line, _), (end_line, _))
+                        if start_line != end_line =>
+                    {
+                        self.inner.continued_line.as_deref().unwrap_or("")
+                    }
+                    _ => self.inner.line.as_str(),
+                };
+                Some(visual_col(reference, end, tab_width))
+            }
+            _ => None,
+        };
+
+        match tab_width {
+            Some(tab_width) => {
+                let visual_start = visual_col(&self.inner.line, start, tab_width);
+                for _ in 1..visual_start {
+                    underline.push(' ');
+                }
+            }
+            None => {
+                let line_chars = self.inner.line.chars();
+                for c in line_chars.take(start - 1) {
+                    match c {
+                        '\t' => underline.push('\t'),
+                        _ => underline.push(' '),
+                    }
+                }
             }
         }
 
-        if let Some(end) = end {
+        if let (Some(visual_end), Some(tab_width)) = (visual_end, tab_width) {
+            let visual_start = visual_col(&self.inner.line, start, tab_width);
+            // Reproduce the historical marker shape using display columns: one
+            // caret when the endpoints share a visual column, two carets (joined
+            // by dashes/spaces) otherwise.
             underline.push('^');
-            if end - start > 1 {
-                for _ in 2..(end - start) {
-                    underline.push('-');
+            if visual_end > visual_start {
+                let between = visual_end - visual_start - 1;
+                let fill_char = if same_line { '-' } else { ' ' };
+                for _ in 0..between {
+                    underline.push(fill_char);
                 }
+                underline.push('^');
+            }
+        } else if let Some(end) = end {
+            underline.push('^');
+            for _ in 2..(end - start) {
+                underline.push('-');
+            }
+            if end - start > 1 {
                 underline.push('^');
             }
         } else {
@@ -622,7 +737,27 @@ impl<R: RuleType> Error<R> {
             .map(|path| format!("{path}:"))
             .unwrap_or_default();
 
-        let pair = (self.line_col.clone(), &self.inner.continued_line);
+        let tab_width = self.inner.tab_width;
+        // Header column and rendered lines only change when tab expansion is
+        // enabled; the internal byte/char locations stay untouched.
+        let visual_start_col = match tab_width {
+            Some(tab_width) => visual_col(&self.inner.line, self.start().1, tab_width),
+            None => self.start().1,
+        };
+        let rendered_line = match tab_width {
+            Some(tab_width) => Cow::Owned(expand_tabs(&self.inner.line, tab_width)),
+            None => Cow::Borrowed(self.inner.line.as_str()),
+        };
+        let rendered_continued_line: Option<Cow<'_, str>> =
+            match (&self.inner.continued_line, tab_width) {
+                (Some(continued), Some(tab_width)) => {
+                    Some(Cow::Owned(expand_tabs(continued, tab_width)))
+                }
+                (Some(continued), None) => Some(Cow::Borrowed(continued.as_str())),
+                (None, _) => None,
+            };
+
+        let pair = (self.line_col.clone(), &rendered_continued_line);
         if let (LineColLocation::Span(_, end), Some(ref continued_line)) = pair {
             let has_line_gap = end.0 - self.start().0 > 1;
             if has_line_gap {
@@ -640,8 +775,8 @@ impl<R: RuleType> Error<R> {
                     p = path,
                     ls = self.start().0,
                     le = end.0,
-                    c = self.start().1,
-                    line = self.inner.line,
+                    c = visual_start_col,
+                    line = rendered_line,
                     continued_line = continued_line,
                     underline = self.underline(),
                     message = self.message()
@@ -660,8 +795,8 @@ impl<R: RuleType> Error<R> {
                     p = path,
                     ls = self.start().0,
                     le = end.0,
-                    c = self.start().1,
-                    line = self.inner.line,
+                    c = visual_start_col,
+                    line = rendered_line,
                     continued_line = continued_line,
                     underline = self.underline(),
                     message = self.message()
@@ -678,8 +813,8 @@ impl<R: RuleType> Error<R> {
                 s = spacing,
                 p = path,
                 l = self.start().0,
-                c = self.start().1,
-                line = self.inner.line,
+                c = visual_start_col,
+                line = rendered_line,
                 underline = self.underline(),
                 message = self.message()
             )
@@ -746,6 +881,52 @@ impl<R: RuleType> fmt::Display for ErrorVariant<R> {
 
 fn visualize_whitespace(input: &str) -> String {
     input.to_owned().replace('\r', "␍").replace('\n', "␊")
+}
+
+/// Expands every tab in `line` into the spaces needed to reach the next tab
+/// stop. `tab_width` must be greater than zero.
+///
+/// Any other character, including multibyte characters, is copied unchanged and
+/// advances the display column by one, matching pest's character-based
+/// [`Position`] semantics.
+fn expand_tabs(line: &str, tab_width: usize) -> String {
+    let mut expanded = String::with_capacity(line.len());
+    let mut visual_col = 1usize;
+    for c in line.chars() {
+        if c == '\t' {
+            let spaces = tab_width - ((visual_col - 1) % tab_width);
+            for _ in 0..spaces {
+                expanded.push(' ');
+            }
+            visual_col += spaces;
+        } else {
+            expanded.push(c);
+            visual_col += 1;
+        }
+    }
+
+    expanded
+}
+
+/// Converts a 1-based character column on `line` into the 1-based display
+/// column once tabs are expanded to the given (non-zero) tab width.
+///
+/// The column itself follows [`Position`] semantics (chars, not bytes), so
+/// multibyte characters count as one column.
+fn visual_col(line: &str, char_col: usize, tab_width: usize) -> usize {
+    let mut visual_col = 1usize;
+    for (i, c) in line.chars().enumerate() {
+        if i + 1 >= char_col {
+            break;
+        }
+        if c == '\t' {
+            visual_col += tab_width - ((visual_col - 1) % tab_width);
+        } else {
+            visual_col += 1;
+        }
+    }
+
+    visual_col
 }
 
 #[cfg(feature = "miette-error")]
@@ -1184,6 +1365,187 @@ mod tests {
             ]
             .join("\n")
         );
+    }
+
+    #[test]
+    fn display_tab_width_pos_caret_width_2() {
+        // Two short lines with a tab next to a multibyte (Chinese) character.
+        // `中`/`文` are three bytes each but only one character column, and the
+        // lines are joined with CRLF which keeps the existing Position semantics.
+        let input = "a\t中b\r\nc\t文d";
+        // Byte 2 points at `中` (char column 3); expanded with tab width 2 the
+        // tab after `a` becomes one space, so the display column is 3.
+        let pos = Position::new(input, 2).unwrap();
+        let error: Error<u32> = Error::new_from_pos(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            pos,
+        )
+        .with_tab_width(2);
+
+        assert_eq!(error.tab_width(), Some(2));
+        // The internal byte position/character column are untouched.
+        assert_eq!(error.location, InputLocation::Pos(2));
+        assert_eq!(error.line_col, LineColLocation::Pos((1, 3)));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 1:3",
+                "  |",
+                "1 | a 中b",
+                "  |   ^---",
+                "  |",
+                "  = error: big one"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_tab_width_pos_caret_width_4() {
+        let input = "a\t中b\r\nc\t文d";
+        // Byte 2 still points at `中` (char column 3); with tab width 4 the tab
+        // expands to three spaces, moving the caret to display column 5.
+        let pos = Position::new(input, 2).unwrap();
+        let error: Error<u32> = Error::new_from_pos(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            pos,
+        )
+        .with_tab_width(4);
+
+        assert_eq!(error.location, InputLocation::Pos(2));
+        assert_eq!(error.line_col, LineColLocation::Pos((1, 3)));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 1:5",
+                "  |",
+                "1 | a   中b",
+                "  |     ^---",
+                "  |",
+                "  = error: big one"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_tab_width_span_across_lines_adjacent() {
+        // Span covers both lines of the two-line CRLF input: from `中` on line 1
+        // to `文` on line 2. Start/end byte range and character columns stay
+        // raw; only the rendered caret columns follow the tab width.
+        let input = "a\t中b\r\nc\t文d";
+        let start = Position::new(input, 2).unwrap();
+        // End just after `文` on line 2 so the span genuinely covers both lines.
+        let end = Position::new(input, 13).unwrap();
+        let error: Error<u32> = Error::new_from_span(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            start.span(&end),
+        )
+        .with_tab_width(2);
+
+        assert_eq!(error.tab_width(), Some(2));
+        assert_eq!(error.location, InputLocation::Span((2, 13)));
+        assert_eq!(error.line_col, LineColLocation::Span((1, 3), (2, 4)));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 1:3",
+                "  |",
+                "1 | a 中b",
+                "2 | c 文d",
+                "  |   ^^",
+                "  |",
+                "  = error: big one"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_tab_width_span_across_lines_with_gap_keeps_omission() {
+        // Three lines; the span skips the middle line, so the historical `...`
+        // omission rule is still applied while tabs are expanded.
+        let input = "a\t中b\r\nmiddle\r\nc\t文d";
+        let start = Position::new(input, 2).unwrap();
+        // End exactly at `文` (a 3-byte char) on line 3; the span still covers
+        // all three lines so the `...` omission is exercised.
+        let end = Position::new(input, 18).unwrap();
+        let error: Error<u32> = Error::new_from_span(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            start.span(&end),
+        )
+        .with_tab_width(2);
+
+        assert_eq!(error.location, InputLocation::Span((2, 18)));
+        assert_eq!(error.line_col, LineColLocation::Span((1, 3), (3, 3)));
+
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 1:3",
+                "  |",
+                "1 | a 中b",
+                "  | ...",
+                "3 | c 文d",
+                "  |   ^",
+                "  |",
+                "  = error: big one"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn display_tab_width_default_keeps_raw_tabs() {
+        // Without `with_tab_width` nothing changes: tabs are echoed verbatim and
+        // character columns are used for the caret.
+        let input = "a\t中b\r\nc\t文d";
+        let pos = Position::new(input, 2).unwrap();
+        let error: Error<u32> = Error::new_from_pos(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            pos,
+        );
+
+        assert_eq!(error.tab_width(), None);
+        assert_eq!(
+            format!("{error}"),
+            [
+                " --> 1:3",
+                "  |",
+                "1 | a\t中b",
+                "  |  \t^---",
+                "  |",
+                "  = error: big one"
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tab width must not be zero")]
+    fn display_tab_width_zero_is_rejected() {
+        let input = "a\t中b";
+        let pos = Position::new(input, 2).unwrap();
+        let _: Error<u32> = Error::new_from_pos(
+            ErrorVariant::CustomError {
+                message: "error: big one".to_owned(),
+            },
+            pos,
+        )
+        .with_tab_width(0);
     }
 
     #[test]
